@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import matplotlib.pyplot as plt  # Required for the chart
+import matplotlib.pyplot as plt
 from datetime import datetime, date
 import time
 import random
@@ -18,15 +18,19 @@ def days_until(date_str):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_options_data(ticker_symbol, min_dte_days, max_dte_days, limit_requests=True):
+    """
+    Fetches data without any UI elements (st.progress, st.toast) inside.
+    This fixes the caching error.
+    """
     tk = yf.Ticker(ticker_symbol)
     
     try:
         expirations = tk.options
     except Exception:
-        return None, "Could not fetch expirations. Yahoo might be blocking this IP temporarily."
+        return None, "Could not fetch expirations. Yahoo might be blocking this IP temporarily.", None
     
     if not expirations:
-        return None, "No options data found."
+        return None, "No options data found.", None
 
     # 1. Filter Dates
     relevant_dates = []
@@ -41,24 +45,26 @@ def get_options_data(ticker_symbol, min_dte_days, max_dte_days, limit_requests=T
             continue
 
     if not relevant_dates:
-        return None, f"No expirations found between {min_dte_days}-{max_dte_days} days."
+        return None, f"No expirations found between {min_dte_days}-{max_dte_days} days.", None
 
     # 2. LIMIT VOLUME (Safe Mode)
+    warning_msg = None
     if limit_requests and len(relevant_dates) > 3:
         first = relevant_dates[0]
         last = relevant_dates[-1]
         mid = relevant_dates[len(relevant_dates)//2]
         subset = sorted(list(set([first, mid, last])))
         
-        st.toast(f"⚠️ Safe Mode: Scanning only 3 dates: {', '.join(subset)}", icon="🛡️")
+        # We pass this warning out instead of calling st.toast here
+        warning_msg = f"⚠️ Safe Mode: Scanned only 3 dates ({', '.join(subset)}) to avoid rate limits."
         relevant_dates = subset
 
     all_puts = []
-    progress_text = f"Scanning {len(relevant_dates)} dates..."
-    my_bar = st.progress(0, text=progress_text)
     
+    # We removed the progress bar loop here to fix the error.
+    # Instead, we just loop quietly.
     for i, exp_date in enumerate(relevant_dates):
-        my_bar.progress(int(((i + 1) / len(relevant_dates)) * 100), text=f"Fetching {exp_date}...")
+        # Sleep to be polite (still needed for Yahoo)
         time.sleep(random.uniform(1.0, 2.0))
         
         try:
@@ -74,13 +80,11 @@ def get_options_data(ticker_symbol, min_dte_days, max_dte_days, limit_requests=T
         except Exception:
             continue
             
-    my_bar.empty()
-    
     if not all_puts:
-        return None, "No put contracts found (or connection blocked)."
+        return None, "No put contracts found (or connection blocked).", warning_msg
         
     df = pd.concat(all_puts, ignore_index=True)
-    return df, None
+    return df, None, warning_msg
 
 def calculate_metrics(df, underlying_price, crash_drop=0.35):
     df['dte'] = df['expiration'].apply(days_until)
@@ -114,14 +118,11 @@ with st.sidebar:
     safe_mode = st.checkbox("Safe Mode (Limit to 3 dates)", value=True)
 
     st.subheader("Liquidity Filters")
-    # UPDATED DEFAULTS: Set to 0/10 to avoid filtering everything out
     min_vol = st.number_input("Min Volume (Today)", value=0, step=1, help="Set to 0 if market is quiet.")
     min_oi = st.number_input("Min Open Interest", value=10, step=50)
 
     st.subheader("Convexity Filters")
-    # UPDATED DEFAULT: 10% OTM
     min_otm = st.slider("Min OTM %", 0.05, 0.5, 0.10)
-    # UPDATED DEFAULT: 2% Premium
     max_prem_pct = st.number_input("Max Premium %", value=0.02, format="%.4f")
     
     st.subheader("Scenario")
@@ -138,9 +139,13 @@ if run_btn:
         
         st.success(f"**{ticker}** Spot: **${current_price:,.2f}**")
         
-        # 2. Get Data
-        raw_df, error = get_options_data(ticker, min_dte, max_dte, limit_requests=safe_mode)
+        # 2. Get Data (with spinner instead of progress bar)
+        with st.spinner("Fetching option chains... (this takes a few seconds)"):
+            raw_df, error, warning = get_options_data(ticker, min_dte, max_dte, limit_requests=safe_mode)
         
+        if warning:
+            st.toast(warning, icon="🛡️")
+            
         if error:
             st.warning(error)
             st.stop()
@@ -230,7 +235,7 @@ if run_btn:
                 scatter = ax.scatter(
                     summary["dte"],
                     summary["avg_multiple"],
-                    s=summary["count"] * 50.0, # Scale bubbles up
+                    s=summary["count"] * 50.0,
                     alpha=0.6,
                     c='red',
                     edgecolors='black'

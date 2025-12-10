@@ -17,7 +17,6 @@ def days_until(date_str):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_options_data(ticker_symbol, min_dte_days, max_dte_days, limit_requests=True):
-    # Let yfinance handle the session internally to avoid "curl_cffi" errors
     tk = yf.Ticker(ticker_symbol)
     
     try:
@@ -43,14 +42,14 @@ def get_options_data(ticker_symbol, min_dte_days, max_dte_days, limit_requests=T
     if not relevant_dates:
         return None, f"No expirations found between {min_dte_days}-{max_dte_days} days."
 
-    # 2. LIMIT VOLUME
+    # 2. LIMIT VOLUME (Safe Mode)
     if limit_requests and len(relevant_dates) > 3:
         first = relevant_dates[0]
         last = relevant_dates[-1]
         mid = relevant_dates[len(relevant_dates)//2]
         subset = sorted(list(set([first, mid, last])))
         
-        st.toast(f"⚠️ Safe Mode: Scanning only 3 dates to avoid blocks: {', '.join(subset)}", icon="🛡️")
+        st.toast(f"⚠️ Safe Mode: Scanning only 3 dates: {', '.join(subset)}", icon="🛡️")
         relevant_dates = subset
 
     all_puts = []
@@ -83,13 +82,11 @@ def calculate_metrics(df, underlying_price, crash_drop=0.35):
     df['otm_pct'] = (underlying_price - df['strike']) / underlying_price
     df['prem_frac'] = df['lastPrice'] / underlying_price
     
-    # --- NEW: Explicit Crash Values ---
+    # Crash Scenario
     crash_price = underlying_price * (1 - crash_drop)
-    
-    # The value of the put if market hits crash_price: max(Strike - CrashPrice, 0)
     df['crash_value'] = (df['strike'] - crash_price).clip(lower=0)
     
-    # The Multiple: Crash Value / Current Cost
+    # Avoid division by zero/pennies
     df['crash_multiple'] = np.where(
         df['lastPrice'] > 0.01, 
         df['crash_value'] / df['lastPrice'], 
@@ -139,8 +136,6 @@ if run_btn:
         # 3. Calculate
         df, crash_price = calculate_metrics(raw_df, current_price, crash_drop)
         
-        st.info(f"📉 **Scenario:** If {ticker} drops **{crash_drop:.0%}** (to **${crash_price:,.2f}**)...")
-
         # 4. Filter
         mask_otm = df['otm_pct'] >= min_otm
         mask_prem = df['prem_frac'] <= max_prem_pct
@@ -152,29 +147,47 @@ if run_btn:
         else:
             filtered = filtered.sort_values('crash_multiple', ascending=False).head(20)
             
-            # --- NEW: Clean "Story" Table ---
-            display = pd.DataFrame()
-            display['Expiration'] = filtered['expiration']
-            display['Strike'] = filtered['strike']
-            display['Cost Now'] = filtered['lastPrice']
-            display['Value in Crash'] = filtered['crash_value']
-            display['Multiplier (x)'] = filtered['crash_multiple']
-            display['OTM %'] = filtered['otm_pct']
-
-            # Formatting
-            display['OTM %'] = display['OTM %'].apply(lambda x: f"{x:.1%}")
-            display['Multiplier (x)'] = display['Multiplier (x)'].apply(lambda x: f"{x:.1f}x")
-            display['Cost Now'] = display['Cost Now'].apply(lambda x: f"${x:.2f}")
-            display['Value in Crash'] = display['Value in Crash'].apply(lambda x: f"${x:.2f}")
-            display['Strike'] = display['Strike'].apply(lambda x: f"${x:.0f}")
+            # --- PREPARE DATA FOR DISPLAY ---
+            # We keep the data numeric so the gradient works, then format it later
+            display = filtered[['expiration', 'strike', 'lastPrice', 'crash_value', 'crash_multiple', 'otm_pct']].copy()
             
-            st.dataframe(display, use_container_width=True)
-            st.success(f"Top {len(filtered)} candidates shown above.")
-            st.markdown(
-                f"> **Intuition Example:** For the top row, you pay **{display.iloc[0]['Cost Now']}** today. "
-                f"If the market crashes to **${crash_price:,.2f}**, that option becomes worth **{display.iloc[0]['Value in Crash']}**. "
-                f"That is a **{display.iloc[0]['Multiplier (x)']}** return."
-            )
+            # Rename for the user
+            display.columns = ['Expiration', 'Strike', 'Cost Now', 'Value in Crash', 'Multiplier (x)', 'OTM %']
+
+            # --- EXPLANATION BOX ---
+            st.markdown(f"""
+            ---
+            ### 🔮 What you're seeing
+            Each row is a **Put Option** on **{ticker}**.
+            * **Cost Now:** What you pay today to buy 1 contract (x100).
+            * **OTM %:** How far below the current price the strike is.
+            * **Multiplier (x):** How many times your money this option might be worth if **{ticker}** instantly dropped **{crash_drop:.0%}** (to **${crash_price:,.2f}**).
+            
+            > *Note: This ignores bid/ask spreads and IV changes. It is a theoretical "intrinsic value" calculation.*
+            """)
+
+            # --- STYLING MAGIC ---
+            # 1. Format the numbers (Currency, Percent, etc.)
+            # 2. Color scale the 'Multiplier'
+            # 3. Bold the top 5 rows
+            
+            def bold_top_rows(x):
+                # Returns a list of CSS strings, one for each row.
+                # If row index is < 5, return 'font-weight: bold'
+                return ['font-weight: bold' if i < 5 else '' for i in range(len(x))]
+
+            styler = display.style\
+                .format({
+                    'Strike': '${:,.0f}',
+                    'Cost Now': '${:.2f}',
+                    'Value in Crash': '${:.2f}',
+                    'Multiplier (x)': '{:.1f}x',
+                    'OTM %': '{:.1%}'
+                })\
+                .background_gradient(subset=['Multiplier (x)'], cmap='Greens')\
+                .apply(bold_top_rows, axis=0) # Apply bold to top 5 rows
+
+            st.dataframe(styler, use_container_width=True)
 
     except Exception as e:
         st.error(f"Error: {e}")

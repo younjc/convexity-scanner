@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import matplotlib.pyplot as plt  # Required for the chart
 from datetime import datetime, date
 import time
 import random
@@ -65,7 +66,7 @@ def get_options_data(ticker_symbol, min_dte_days, max_dte_days, limit_requests=T
             puts = chain.puts
             puts['expiration'] = exp_date
             
-            # Ensure columns exist and fill NaNs for volume/OI
+            # Ensure columns exist and fill NaNs
             if 'lastPrice' in puts.columns and 'strike' in puts.columns:
                 puts['volume'] = puts.get('volume', pd.Series([0]*len(puts))).fillna(0)
                 puts['openInterest'] = puts.get('openInterest', pd.Series([0]*len(puts))).fillna(0)
@@ -113,15 +114,14 @@ with st.sidebar:
     safe_mode = st.checkbox("Safe Mode (Limit to 3 dates)", value=True)
 
     st.subheader("Liquidity Filters")
-    # CHANGE 1: Set Volume default to 0. Use OI to check liquidity instead.
+    # UPDATED DEFAULTS: Set to 0/10 to avoid filtering everything out
     min_vol = st.number_input("Min Volume (Today)", value=0, step=1, help="Set to 0 if market is quiet.")
-    # CHANGE 2: Lower OI default to 10 to see more candidates.
     min_oi = st.number_input("Min Open Interest", value=10, step=50)
 
     st.subheader("Convexity Filters")
-    # CHANGE 3: Lower OTM to 10% (0.1) so you can see "near" misses.
+    # UPDATED DEFAULT: 10% OTM
     min_otm = st.slider("Min OTM %", 0.05, 0.5, 0.10)
-    # CHANGE 4: Raise Max Premium to 2% (0.02) just to get data flowing.
+    # UPDATED DEFAULT: 2% Premium
     max_prem_pct = st.number_input("Max Premium %", value=0.02, format="%.4f")
     
     st.subheader("Scenario")
@@ -165,13 +165,12 @@ if run_btn:
             display = filtered[['expiration', 'strike', 'lastPrice', 'volume', 'openInterest', 'crash_value', 'crash_multiple', 'otm_pct']].copy()
             display.columns = ['Expiration', 'Strike', 'Cost Now', 'Vol', 'Open Int', 'Value in Crash', 'Multiplier (x)', 'OTM %']
 
-            # --- EXPLANATION BOX ---
+            # --- EXPLANATION BOXES ---
             st.markdown(f"""
             ---
             ### 🔮 What you're seeing
             Each row is a **Put Option** on **{ticker}**.
             * **Cost Now:** What you pay today.
-            * **Vol / Open Int:** Volume today / Total open contracts (Liquidity check).
             * **Multiplier (x):** Theoretical return if **{ticker}** drops **{crash_drop:.0%}** (to **${crash_price:,.2f}**).
             """)
             
@@ -182,7 +181,7 @@ if run_btn:
             3. **Understanding convexity** helps you see which options offer the most asymmetry—small, controlled cost today for disproportionately large protection in rare events.
             """)
 
-            # --- STYLING MAGIC ---
+            # --- TABLE ---
             def bold_top_rows(x):
                 return ['font-weight: bold' if i < 5 else '' for i in range(len(x))]
 
@@ -200,7 +199,60 @@ if run_btn:
                 .apply(bold_top_rows, axis=0)
 
             st.dataframe(styler, use_container_width=True)
+
+            # --- CHART: Convexity Bubble View ---
+            st.divider()
             
+            # Ensure proper types for plotting
+            filtered["dte"] = filtered["dte"].astype(float)
+            filtered["expiration_str"] = filtered["expiration"].astype(str)
+
+            # Group by expiration
+            summary = (
+                filtered.groupby(["expiration_str", "dte"])
+                .agg(
+                    avg_multiple=("crash_multiple", "mean"),
+                    max_multiple=("crash_multiple", "max"),
+                    count=("crash_multiple", "size"),
+                )
+                .reset_index()
+            )
+
+            if not summary.empty:
+                st.markdown("### 📆 Convexity by Expiration (Bubble View)")
+                st.caption(
+                    "Vertical position = Average Crash Multiplier. Bubble size = Number of cheap options found."
+                )
+
+                fig, ax = plt.subplots(figsize=(8, 4))
+                
+                # Plot
+                scatter = ax.scatter(
+                    summary["dte"],
+                    summary["avg_multiple"],
+                    s=summary["count"] * 50.0, # Scale bubbles up
+                    alpha=0.6,
+                    c='red',
+                    edgecolors='black'
+                )
+
+                ax.set_xlabel("Days to Expiration")
+                ax.set_ylabel("Avg Multiplier (x)")
+                ax.grid(True, linestyle='--', alpha=0.3)
+
+                # Label the bubbles
+                for _, row in summary.iterrows():
+                    ax.text(
+                        row["dte"],
+                        row["avg_multiple"],
+                        row["expiration_str"],
+                        fontsize=8,
+                        ha="center",
+                        va="bottom"
+                    )
+
+                st.pyplot(fig)
+
             # --- DISCLAIMER ---
             st.divider()
             st.caption("""

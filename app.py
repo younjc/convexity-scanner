@@ -199,4 +199,11 @@ if run_btn:
             
             # --- DISCLAIMER ---
             st.divider()
-            st
+            st.caption("""
+            **Simple Disclaimer:** This tool is for educational and research purposes only. It does not provide financial advice, trading signals, or predictions.  
+            Values shown (including crash scenarios and multipliers) are theoretical, simplified, and ignore real-world factors like volatility changes, liquidity, spreads, slippage, and execution risk.  
+            Use this to understand convexity, not to make trading decisions.
+            """)
+
+    except Exception as e:
+        st.error(f"Error: {e}")

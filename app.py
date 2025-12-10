@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm  # For color mapping
+import matplotlib.cm as cm
 from datetime import datetime, date
 import time
 import random
@@ -56,7 +56,7 @@ def get_options_data(ticker_symbol, min_dte_days, max_dte_days, max_dates_to_sca
     all_puts = []
     
     for i, exp_date in enumerate(valid_dates):
-        # Slightly shorter sleep for batch mode, but still safe
+        # Slightly shorter sleep for batch mode
         time.sleep(random.uniform(0.5, 1.5))
         
         try:
@@ -102,7 +102,6 @@ st.caption("Compare crash protection across multiple assets simultaneously.")
 with st.sidebar:
     st.header("Settings")
     
-    # --- UPDATED INPUT: BATCH TICKERS ---
     st.subheader("Target Assets")
     ticker_input = st.text_input(
         "Enter Tickers (comma-separated)", 
@@ -139,7 +138,6 @@ with st.sidebar:
     run_btn = st.button("Run Batch Scan", type="primary")
 
 if run_btn:
-    # Parse tickers
     tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
     
     if not tickers:
@@ -149,14 +147,12 @@ if run_btn:
     master_results = []
     errors = []
     
-    # --- BATCH LOOP ---
     progress_bar = st.progress(0, text="Starting Batch Scan...")
     
     for idx, ticker in enumerate(tickers):
         progress_bar.progress(int((idx / len(tickers)) * 100), text=f"Scanning {ticker}...")
         
         try:
-            # 1. Get Price
             stock = yf.Ticker(ticker)
             hist = stock.history(period="1d")
             if hist.empty:
@@ -164,18 +160,13 @@ if run_btn:
                 continue
             current_price = hist['Close'].iloc[-1]
             
-            # 2. Get Data
             raw_df, err, warn = get_options_data(ticker, min_dte, max_dte, max_dates)
             
             if err:
-                # Log error but continue to next ticker
-                # errors.append(f"{ticker}: {err}") 
                 continue
             
-            # 3. Calculate
             df, crash_price = calculate_metrics(raw_df, current_price, crash_drop)
             
-            # 4. Filter
             mask_otm = df['otm_pct'] >= min_otm
             mask_prem = df['prem_frac'] <= max_prem_pct
             mask_vol = df['volume'] >= min_vol
@@ -184,7 +175,6 @@ if run_btn:
             filtered = df[mask_otm & mask_prem & mask_vol & mask_oi].copy()
             
             if not filtered.empty:
-                # Add Ticker Column
                 filtered.insert(0, "Ticker", ticker)
                 master_results.append(filtered)
                 
@@ -193,20 +183,15 @@ if run_btn:
             
     progress_bar.empty()
 
-    # --- DISPLAY RESULTS ---
     if not master_results:
         st.warning("No options found matching your criteria for any of the entered tickers.")
         if errors:
             with st.expander("View Errors"):
                 st.write(errors)
     else:
-        # Combine all dataframes
         final_df = pd.concat(master_results, ignore_index=True)
-        
-        # Sort by Multiplier globally
         final_df = final_df.sort_values('crash_multiple', ascending=False)
         
-        # Toggle Logic
         if not show_all_results:
             display_data = final_df.head(20)
             st.success(f"✅ Found {len(final_df)} total candidates. Showing Top 20.")
@@ -214,7 +199,6 @@ if run_btn:
             display_data = final_df
             st.success(f"✅ Found {len(final_df)} candidates across {len(tickers)} tickers.")
 
-        # --- DOWNLOAD BUTTON ---
         csv = final_df.to_csv(index=False).encode('utf-8')
         st.download_button(
             label="📥 Download Full Batch Results (CSV)",
@@ -223,7 +207,6 @@ if run_btn:
             mime='text/csv',
         )
         
-        # --- TABLE ---
         view = display_data[['Ticker', 'expiration', 'strike', 'lastPrice', 'volume', 'openInterest', 'crash_value', 'crash_multiple', 'otm_pct']].copy()
         view.columns = ['Ticker', 'Expiration', 'Strike', 'Cost Now', 'Vol', 'Open Int', 'Value in Crash', 'Multiplier (x)', 'OTM %']
 
@@ -245,10 +228,9 @@ if run_btn:
 
         st.dataframe(styler, use_container_width=True)
         
-        # --- EXPLANATION ---
         st.info(f"**Scenario:** If market drops **{crash_drop:.0%}**, these options explode. 'Multiplier' = Payoff / Cost.")
 
-        # --- MULTI-COLOR CHART ---
+        # --- MULTI-COLOR CHART (FIXED LEGEND) ---
         st.divider()
         
         chart_data = final_df.copy()
@@ -269,12 +251,10 @@ if run_btn:
             
             fig, ax = plt.subplots(figsize=(10, 5))
             
-            # Create a color map for tickers
             unique_tickers = summary['Ticker'].unique()
             colors = plt.cm.tab10(np.linspace(0, 1, len(unique_tickers)))
             color_map = dict(zip(unique_tickers, colors))
             
-            # Plot each ticker as a separate series
             for ticker in unique_tickers:
                 subset = summary[summary['Ticker'] == ticker]
                 ax.scatter(
@@ -290,10 +270,13 @@ if run_btn:
             ax.set_xlabel("Days to Expiration")
             ax.set_ylabel("Avg Multiplier (x)")
             ax.grid(True, linestyle='--', alpha=0.3)
-            ax.legend(title="Ticker")
+            
+            # --- THE FIX IS HERE ---
+            # Moves legend outside the plot area
+            ax.legend(title="Ticker", bbox_to_anchor=(1.05, 1), loc='upper left')
+            plt.tight_layout()
             
             st.pyplot(fig)
 
-        # --- DISCLAIMER ---
         st.divider()
         st.caption("Disclaimer: Educational use only. Theoretical values. Not financial advice.")

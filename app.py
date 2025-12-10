@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import requests
 from datetime import datetime, date
 import time
 import random
@@ -16,21 +15,10 @@ def days_until(date_str):
     d = datetime.strptime(date_str, '%Y-%m-%d').date()
     return (d - date.today()).days
 
-def get_session():
-    """
-    Creates a custom session with a browser-like User-Agent.
-    This helps trick Yahoo into thinking we are a real user, not a script.
-    """
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    })
-    return session
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_options_data(ticker_symbol, min_dte_days, max_dte_days, limit_requests=True):
-    session = get_session()
-    tk = yf.Ticker(ticker_symbol, session=session)
+    # FIXED: Let yfinance handle the session internally
+    tk = yf.Ticker(ticker_symbol)
     
     try:
         expirations = tk.options
@@ -76,7 +64,7 @@ def get_options_data(ticker_symbol, min_dte_days, max_dte_days, limit_requests=T
     for i, exp_date in enumerate(relevant_dates):
         my_bar.progress(int(((i + 1) / len(relevant_dates)) * 100), text=f"Fetching {exp_date}...")
         
-        # Sleep to be polite
+        # Sleep to be polite (Still needed to prevent 429 errors)
         time.sleep(random.uniform(1.0, 2.0))
         
         try:
@@ -131,19 +119,20 @@ with st.sidebar:
     safe_mode = st.checkbox("Safe Mode (Limit to 3 dates)", value=True, help="Uncheck this to scan ALL dates, but you risk getting blocked.")
 
     st.subheader("Filters")
-    min_otm = st.slider("Min OTM %", 0.1, 0.5, 0.2)
+    # UPDATED DEFAULTS: Looser settings to ensure you see results first
+    min_otm = st.slider("Min OTM %", 0.1, 0.5, 0.15)
     max_prem_pct = st.number_input("Max Premium %", value=0.01, format="%.4f")
     
     st.subheader("Scenario")
-    crash_drop = st.number_input("Crash Drop %", value=0.30)
+    crash_drop = st.number_input("Crash Drop %", value=0.25)
     
     run_btn = st.button("Run Scanner", type="primary")
 
 if run_btn:
     try:
         # 1. Get Spot Price
-        session = get_session()
-        stock = yf.Ticker(ticker, session=session)
+        # FIXED: Removed session argument
+        stock = yf.Ticker(ticker)
         fast_info = stock.fast_info
         
         # Fallback if fast_info fails

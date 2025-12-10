@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D # Required for the custom legend
 import matplotlib.cm as cm
 from datetime import datetime, date
 import time
@@ -213,6 +214,22 @@ if run_btn:
         view = display_data[['Ticker', 'expiration', 'strike', 'lastPrice', 'volume', 'openInterest', 'crash_value', 'crash_multiple', 'otm_pct']].copy()
         view.columns = ['Ticker', 'Expiration', 'Strike', 'Cost Now', 'Vol', 'Open Int', 'Value in Crash', 'Multiplier (x)', 'OTM %']
 
+        # --- EXPLANATION BOX ---
+        st.divider()
+        st.markdown(f"""
+        ### 🔮 What you're seeing
+        Each row is a **Put Option**.
+        * **Cost Now:** What you pay today to buy 1 contract (x100).
+        * **Multiplier (x):** Theoretical return if the asset drops **{crash_drop:.0%}**.
+        """)
+
+        st.info("""
+        **What this means (Convexity in 3 sentences):**
+        1. **Convexity measures** how much an option’s value can accelerate during sharp market moves.
+        2. **Far out-of-the-money puts** often behave like “insurance with leverage,” costing very little but responding explosively in a crash.
+        3. **Understanding convexity** helps you see which options offer the most asymmetry—small, controlled cost today for disproportionately large protection in rare events.
+        """)
+
         def bold_top_rows(x):
             return ['font-weight: bold' if i < 3 else '' for i in range(len(x))]
 
@@ -230,10 +247,8 @@ if run_btn:
             .apply(bold_top_rows, axis=0)
 
         st.dataframe(styler, use_container_width=True)
-        
-        st.info(f"**Scenario:** If market drops **{crash_drop:.0%}**, these options explode. 'Multiplier' = Payoff / Cost.")
 
-        # --- MULTI-COLOR CHART (FIXED LEGEND) ---
+        # --- MULTI-COLOR CHART WITH FIXED LEGEND ---
         st.divider()
         
         chart_data = final_df.copy()
@@ -255,10 +270,10 @@ if run_btn:
             fig, ax = plt.subplots(figsize=(10, 5))
             
             unique_tickers = summary['Ticker'].unique()
-            # Generate colors
             colors = plt.cm.tab10(np.linspace(0, 1, len(unique_tickers)))
             color_map = dict(zip(unique_tickers, colors))
             
+            # 1. Plot the bubbles
             for ticker in unique_tickers:
                 subset = summary[summary['Ticker'] == ticker]
                 ax.scatter(
@@ -266,7 +281,7 @@ if run_btn:
                     subset["avg_multiple"],
                     s=subset["count"] * 50.0,
                     alpha=0.7,
-                    label=ticker,
+                    label=ticker, # Label here is mostly for internal tracking
                     color=color_map[ticker],
                     edgecolors='black'
                 )
@@ -275,21 +290,29 @@ if run_btn:
             ax.set_ylabel("Avg Multiplier (x)")
             ax.grid(True, linestyle='--', alpha=0.3)
             
-            # --- SAFE LEGEND HANDLING ---
-            # 1. Explicitly fetch handles and labels
-            handles, labels = ax.get_legend_handles_labels()
+            # 2. CREATE CUSTOM LEGEND ("Proxy Artists")
+            # This creates perfect, uniform circles regardless of the messy chart data
+            legend_elements = []
+            for ticker in unique_tickers:
+                legend_elements.append(Line2D(
+                    [0], [0], 
+                    marker='o', 
+                    color='w', 
+                    label=ticker, 
+                    markerfacecolor=color_map[ticker], 
+                    markersize=10, 
+                    markeredgecolor='black'
+                ))
             
-            if handles:
-                # 2. Create Legend Outside
-                lgnd = ax.legend(handles, labels, title="Ticker", bbox_to_anchor=(1.05, 1), loc='upper left')
-                
-                # 3. Check if lgnd exists before trying to loop
-                if lgnd and hasattr(lgnd, 'legendHandles'):
-                    for handle in lgnd.legendHandles:
-                        handle.set_sizes([50.0])
+            # 3. Add the clean legend outside the plot
+            ax.legend(
+                handles=legend_elements, 
+                title="Ticker", 
+                bbox_to_anchor=(1.05, 1), 
+                loc='upper left'
+            )
 
             plt.tight_layout()
-            
             st.pyplot(fig)
 
         st.divider()

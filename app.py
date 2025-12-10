@@ -200,7 +200,7 @@ if run_btn:
                     'Vol': '{:,.0f}',
                     'Open Int': '{:,.0f}'
                 })\
-                .background_gradient(subset=['Multiplier (x)'], cmap='Reds')\
+                .background_gradient(subset=['Multiplier (x)'], cmap='Greens')\
                 .apply(bold_top_rows, axis=0)
 
             st.dataframe(styler, use_container_width=True)

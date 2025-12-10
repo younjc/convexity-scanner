@@ -14,8 +14,11 @@ st.set_page_config(page_title="Convexity Screener", layout="wide")
 # --- Helper Functions ---
 
 def days_until(date_str):
-    d = datetime.strptime(date_str, '%Y-%m-%d').date()
-    return (d - date.today()).days
+    try:
+        d = datetime.strptime(date_str, '%Y-%m-%d').date()
+        return (d - date.today()).days
+    except ValueError:
+        return 0
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_options_data(ticker_symbol, min_dte_days, max_dte_days, max_dates_to_scan):
@@ -252,6 +255,7 @@ if run_btn:
             fig, ax = plt.subplots(figsize=(10, 5))
             
             unique_tickers = summary['Ticker'].unique()
+            # Generate colors
             colors = plt.cm.tab10(np.linspace(0, 1, len(unique_tickers)))
             color_map = dict(zip(unique_tickers, colors))
             
@@ -271,12 +275,18 @@ if run_btn:
             ax.set_ylabel("Avg Multiplier (x)")
             ax.grid(True, linestyle='--', alpha=0.3)
             
-            # --- LEGEND FIX ---
-            lgnd = ax.legend(title="Ticker", bbox_to_anchor=(1.05, 1), loc='upper left')
+            # --- SAFE LEGEND HANDLING ---
+            # 1. Explicitly fetch handles and labels
+            handles, labels = ax.get_legend_handles_labels()
             
-            # Manually force all legend markers to be the same small size
-            for handle in lgnd.legendHandles:
-                handle.set_sizes([50.0])
+            if handles:
+                # 2. Create Legend Outside
+                lgnd = ax.legend(handles, labels, title="Ticker", bbox_to_anchor=(1.05, 1), loc='upper left')
+                
+                # 3. Check if lgnd exists before trying to loop
+                if lgnd and hasattr(lgnd, 'legendHandles'):
+                    for handle in lgnd.legendHandles:
+                        handle.set_sizes([50.0])
 
             plt.tight_layout()
             

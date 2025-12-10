@@ -18,9 +18,6 @@ def days_until(date_str):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_options_data(ticker_symbol, min_dte_days, max_dte_days, max_dates_to_scan):
-    """
-    Fetches data with a user-defined limit on how many dates to scan.
-    """
     tk = yf.Ticker(ticker_symbol)
     
     try:
@@ -31,7 +28,7 @@ def get_options_data(ticker_symbol, min_dte_days, max_dte_days, max_dates_to_sca
     if not expirations:
         return None, "No options data found.", None
 
-    # 1. Filter Dates (Get all valid dates first)
+    # 1. Filter Dates
     valid_dates = []
     today = date.today()
     for exp_str in expirations:
@@ -46,17 +43,14 @@ def get_options_data(ticker_symbol, min_dte_days, max_dte_days, max_dates_to_sca
     if not valid_dates:
         return None, f"No expirations found between {min_dte_days}-{max_dte_days} days.", None
 
-    # 2. APPLY USER LIMIT (The Slider)
+    # 2. APPLY USER LIMIT (Slider)
     warning_msg = None
     if len(valid_dates) > max_dates_to_scan:
-        # If we have 20 dates but user only wants 5, pick 5 evenly spaced ones
         indices = np.linspace(0, len(valid_dates) - 1, max_dates_to_scan, dtype=int)
-        # Use a set to avoid duplicates if range is small
         unique_indices = sorted(list(set(indices)))
-        
         subset = [valid_dates[i] for i in unique_indices]
         
-        warning_msg = f"⚠️ Limit Active: Scanning {len(subset)} dates (out of {len(valid_dates)} available) to prevent blocking."
+        warning_msg = f"⚠️ Limit Active: Scanning {len(subset)} dates (out of {len(valid_dates)} available)."
         valid_dates = subset
 
     all_puts = []
@@ -113,7 +107,6 @@ with st.sidebar:
     min_dte = st.number_input("Min DTE", value=30)
     max_dte = st.number_input("Max DTE", value=90)
     
-    # NEW SLIDER: Replaces the 'Safe Mode' checkbox
     max_dates = st.slider(
         "Max Dates to Scan", 
         min_value=1, 
@@ -132,6 +125,9 @@ with st.sidebar:
     
     st.subheader("Scenario")
     crash_drop = st.number_input("Crash Drop %", value=0.25)
+    
+    st.divider()
+    show_all_results = st.checkbox("Show All Candidates", value=False, help="If unchecked, only shows Top 20.")
     
     run_btn = st.button("Run Scanner", type="primary")
 
@@ -169,10 +165,30 @@ if run_btn:
         if filtered.empty:
             st.info(f"No options found. Try lowering 'Min Volume' or 'Min OTM'. (Scanned {len(df)} contracts).")
         else:
-            filtered = filtered.sort_values('crash_multiple', ascending=False).head(20)
+            # Sort by best multiplier
+            filtered = filtered.sort_values('crash_multiple', ascending=False)
+            
+            # Limit results based on Toggle
+            if not show_all_results:
+                display_data = filtered.head(20)
+                msg = f"Top {len(display_data)} candidates shown (Check 'Show All Candidates' to see full list)."
+            else:
+                display_data = filtered
+                msg = f"Showing all {len(display_data)} candidates."
+
+            st.success(msg)
+            
+            # --- DOWNLOAD BUTTON (NEW) ---
+            csv = filtered.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Results to CSV",
+                data=csv,
+                file_name=f"{ticker}_convexity_scan.csv",
+                mime='text/csv',
+            )
             
             # --- PREPARE DATA FOR DISPLAY ---
-            display = filtered[['expiration', 'strike', 'lastPrice', 'volume', 'openInterest', 'crash_value', 'crash_multiple', 'otm_pct']].copy()
+            display = display_data[['expiration', 'strike', 'lastPrice', 'volume', 'openInterest', 'crash_value', 'crash_multiple', 'otm_pct']].copy()
             display.columns = ['Expiration', 'Strike', 'Cost Now', 'Vol', 'Open Int', 'Value in Crash', 'Multiplier (x)', 'OTM %']
 
             # --- EXPLANATION BOXES ---
@@ -193,6 +209,7 @@ if run_btn:
 
             # --- TABLE ---
             def bold_top_rows(x):
+                # Bold top 5
                 return ['font-weight: bold' if i < 5 else '' for i in range(len(x))]
 
             styler = display.style\
@@ -213,11 +230,12 @@ if run_btn:
             # --- CHART: Convexity Bubble View ---
             st.divider()
             
-            filtered["dte"] = filtered["dte"].astype(float)
-            filtered["expiration_str"] = filtered["expiration"].astype(str)
+            chart_data = filtered.copy()
+            chart_data["dte"] = chart_data["dte"].astype(float)
+            chart_data["expiration_str"] = chart_data["expiration"].astype(str)
 
             summary = (
-                filtered.groupby(["expiration_str", "dte"])
+                chart_data.groupby(["expiration_str", "dte"])
                 .agg(
                     avg_multiple=("crash_multiple", "mean"),
                     max_multiple=("crash_multiple", "max"),

@@ -113,12 +113,16 @@ with st.sidebar:
     safe_mode = st.checkbox("Safe Mode (Limit to 3 dates)", value=True)
 
     st.subheader("Liquidity Filters")
-    min_vol = st.number_input("Min Volume (Today)", value=5, step=5, help="Minimum contracts traded today.")
-    min_oi = st.number_input("Min Open Interest", value=50, step=50, help="Minimum total open contracts.")
+    # CHANGE 1: Set Volume default to 0. Use OI to check liquidity instead.
+    min_vol = st.number_input("Min Volume (Today)", value=0, step=1, help="Set to 0 if market is quiet.")
+    # CHANGE 2: Lower OI default to 10 to see more candidates.
+    min_oi = st.number_input("Min Open Interest", value=10, step=50)
 
     st.subheader("Convexity Filters")
-    min_otm = st.slider("Min OTM %", 0.1, 0.5, 0.15)
-    max_prem_pct = st.number_input("Max Premium %", value=0.01, format="%.4f")
+    # CHANGE 3: Lower OTM to 10% (0.1) so you can see "near" misses.
+    min_otm = st.slider("Min OTM %", 0.05, 0.5, 0.10)
+    # CHANGE 4: Raise Max Premium to 2% (0.02) just to get data flowing.
+    max_prem_pct = st.number_input("Max Premium %", value=0.02, format="%.4f")
     
     st.subheader("Scenario")
     crash_drop = st.number_input("Crash Drop %", value=0.25)

@@ -64,7 +64,11 @@ def get_options_data(ticker_symbol, min_dte_days, max_dte_days, limit_requests=T
             chain = tk.option_chain(exp_date)
             puts = chain.puts
             puts['expiration'] = exp_date
+            
+            # Ensure columns exist and fill NaNs for volume/OI
             if 'lastPrice' in puts.columns and 'strike' in puts.columns:
+                puts['volume'] = puts.get('volume', pd.Series([0]*len(puts))).fillna(0)
+                puts['openInterest'] = puts.get('openInterest', pd.Series([0]*len(puts))).fillna(0)
                 all_puts.append(puts)
         except Exception:
             continue
@@ -108,7 +112,11 @@ with st.sidebar:
     max_dte = st.number_input("Max DTE", value=90)
     safe_mode = st.checkbox("Safe Mode (Limit to 3 dates)", value=True)
 
-    st.subheader("Filters")
+    st.subheader("Liquidity Filters")
+    min_vol = st.number_input("Min Volume (Today)", value=5, step=5, help="Minimum contracts traded today.")
+    min_oi = st.number_input("Min Open Interest", value=50, step=50, help="Minimum total open contracts.")
+
+    st.subheader("Convexity Filters")
     min_otm = st.slider("Min OTM %", 0.1, 0.5, 0.15)
     max_prem_pct = st.number_input("Max Premium %", value=0.01, format="%.4f")
     
@@ -139,41 +147,39 @@ if run_btn:
         # 4. Filter
         mask_otm = df['otm_pct'] >= min_otm
         mask_prem = df['prem_frac'] <= max_prem_pct
+        mask_vol = df['volume'] >= min_vol
+        mask_oi = df['openInterest'] >= min_oi
         
-        filtered = df[mask_otm & mask_prem].copy()
+        filtered = df[mask_otm & mask_prem & mask_vol & mask_oi].copy()
         
         if filtered.empty:
-            st.info("No options found. Try lowering the 'Min OTM' or increasing 'Max Premium'.")
+            st.info(f"No options found. Try lowering 'Min Volume' or 'Min OTM'. (Scanned {len(df)} contracts, but filters were too strict).")
         else:
             filtered = filtered.sort_values('crash_multiple', ascending=False).head(20)
             
             # --- PREPARE DATA FOR DISPLAY ---
-            # We keep the data numeric so the gradient works, then format it later
-            display = filtered[['expiration', 'strike', 'lastPrice', 'crash_value', 'crash_multiple', 'otm_pct']].copy()
-            
-            # Rename for the user
-            display.columns = ['Expiration', 'Strike', 'Cost Now', 'Value in Crash', 'Multiplier (x)', 'OTM %']
+            display = filtered[['expiration', 'strike', 'lastPrice', 'volume', 'openInterest', 'crash_value', 'crash_multiple', 'otm_pct']].copy()
+            display.columns = ['Expiration', 'Strike', 'Cost Now', 'Vol', 'Open Int', 'Value in Crash', 'Multiplier (x)', 'OTM %']
 
             # --- EXPLANATION BOX ---
             st.markdown(f"""
             ---
             ### 🔮 What you're seeing
             Each row is a **Put Option** on **{ticker}**.
-            * **Cost Now:** What you pay today to buy 1 contract (x100).
-            * **OTM %:** How far below the current price the strike is.
-            * **Multiplier (x):** How many times your money this option might be worth if **{ticker}** instantly dropped **{crash_drop:.0%}** (to **${crash_price:,.2f}**).
+            * **Cost Now:** What you pay today.
+            * **Vol / Open Int:** Volume today / Total open contracts (Liquidity check).
+            * **Multiplier (x):** Theoretical return if **{ticker}** drops **{crash_drop:.0%}** (to **${crash_price:,.2f}**).
+            """)
             
-            > *Note: This ignores bid/ask spreads and IV changes. It is a theoretical "intrinsic value" calculation.*
+            st.info("""
+            **What this means (Convexity in 3 sentences):**
+            1. **Convexity measures** how much an option’s value can accelerate during sharp market moves.
+            2. **Far out-of-the-money puts** often behave like “insurance with leverage,” costing very little but responding explosively in a crash.
+            3. **Understanding convexity** helps you see which options offer the most asymmetry—small, controlled cost today for disproportionately large protection in rare events.
             """)
 
             # --- STYLING MAGIC ---
-            # 1. Format the numbers (Currency, Percent, etc.)
-            # 2. Color scale the 'Multiplier'
-            # 3. Bold the top 5 rows
-            
             def bold_top_rows(x):
-                # Returns a list of CSS strings, one for each row.
-                # If row index is < 5, return 'font-weight: bold'
                 return ['font-weight: bold' if i < 5 else '' for i in range(len(x))]
 
             styler = display.style\
@@ -182,12 +188,15 @@ if run_btn:
                     'Cost Now': '${:.2f}',
                     'Value in Crash': '${:.2f}',
                     'Multiplier (x)': '{:.1f}x',
-                    'OTM %': '{:.1%}'
+                    'OTM %': '{:.1%}',
+                    'Vol': '{:,.0f}',
+                    'Open Int': '{:,.0f}'
                 })\
-                .background_gradient(subset=['Multiplier (x)'], cmap='Greens')\
-                .apply(bold_top_rows, axis=0) # Apply bold to top 5 rows
+                .background_gradient(subset=['Multiplier (x)'], cmap='Reds')\
+                .apply(bold_top_rows, axis=0)
 
             st.dataframe(styler, use_container_width=True)
-
-    except Exception as e:
-        st.error(f"Error: {e}")
+            
+            # --- DISCLAIMER ---
+            st.divider()
+            st

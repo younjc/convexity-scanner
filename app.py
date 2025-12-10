@@ -271,9 +271,13 @@ if run_btn:
             ax.set_ylabel("Avg Multiplier (x)")
             ax.grid(True, linestyle='--', alpha=0.3)
             
-            # --- THE FIX IS HERE ---
-            # Moves legend outside the plot area
-            ax.legend(title="Ticker", bbox_to_anchor=(1.05, 1), loc='upper left')
+            # --- LEGEND FIX ---
+            lgnd = ax.legend(title="Ticker", bbox_to_anchor=(1.05, 1), loc='upper left')
+            
+            # Manually force all legend markers to be the same small size
+            for handle in lgnd.legendHandles:
+                handle.set_sizes([50.0])
+
             plt.tight_layout()
             
             st.pyplot(fig)

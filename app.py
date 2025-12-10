@@ -17,7 +17,7 @@ def days_until(date_str):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_options_data(ticker_symbol, min_dte_days, max_dte_days, limit_requests=True):
-    # FIXED: Let yfinance handle the session internally
+    # Let yfinance handle the session internally to avoid "curl_cffi" errors
     tk = yf.Ticker(ticker_symbol)
     
     try:
@@ -43,18 +43,14 @@ def get_options_data(ticker_symbol, min_dte_days, max_dte_days, limit_requests=T
     if not relevant_dates:
         return None, f"No expirations found between {min_dte_days}-{max_dte_days} days."
 
-    # 2. LIMIT VOLUME (Crucial Fix)
-    # If we try to fetch 20 dates, Yahoo bans us.
-    # We will pick at most 3 evenly spaced dates to keep traffic low.
+    # 2. LIMIT VOLUME
     if limit_requests and len(relevant_dates) > 3:
-        # Pick first, middle, and last
         first = relevant_dates[0]
         last = relevant_dates[-1]
         mid = relevant_dates[len(relevant_dates)//2]
-        # remove duplicates if list is short
         subset = sorted(list(set([first, mid, last])))
         
-        st.toast(f"⚠️ To avoid rate limits, scanning only 3 dates: {', '.join(subset)}", icon="🛡️")
+        st.toast(f"⚠️ Safe Mode: Scanning only 3 dates to avoid blocks: {', '.join(subset)}", icon="🛡️")
         relevant_dates = subset
 
     all_puts = []
@@ -63,17 +59,12 @@ def get_options_data(ticker_symbol, min_dte_days, max_dte_days, limit_requests=T
     
     for i, exp_date in enumerate(relevant_dates):
         my_bar.progress(int(((i + 1) / len(relevant_dates)) * 100), text=f"Fetching {exp_date}...")
-        
-        # Sleep to be polite (Still needed to prevent 429 errors)
         time.sleep(random.uniform(1.0, 2.0))
         
         try:
-            # Fetch chain
             chain = tk.option_chain(exp_date)
             puts = chain.puts
             puts['expiration'] = exp_date
-            
-            # Clean columns
             if 'lastPrice' in puts.columns and 'strike' in puts.columns:
                 all_puts.append(puts)
         except Exception:
@@ -92,20 +83,24 @@ def calculate_metrics(df, underlying_price, crash_drop=0.35):
     df['otm_pct'] = (underlying_price - df['strike']) / underlying_price
     df['prem_frac'] = df['lastPrice'] / underlying_price
     
+    # --- NEW: Explicit Crash Values ---
     crash_price = underlying_price * (1 - crash_drop)
-    df['crash_intrinsic'] = (df['strike'] - crash_price).clip(lower=0)
     
+    # The value of the put if market hits crash_price: max(Strike - CrashPrice, 0)
+    df['crash_value'] = (df['strike'] - crash_price).clip(lower=0)
+    
+    # The Multiple: Crash Value / Current Cost
     df['crash_multiple'] = np.where(
         df['lastPrice'] > 0.01, 
-        df['crash_intrinsic'] / df['lastPrice'], 
+        df['crash_value'] / df['lastPrice'], 
         0
     )
-    return df
+    return df, crash_price
 
 # --- Main UI ---
 
-st.title("🛡️ Tail-Risk Convexity Screener (Lite)")
-st.caption("Optimized to avoid Yahoo Finance rate limits")
+st.title("🛡️ Tail-Risk Convexity Screener")
+st.caption("Find cheap options that explode in value during a market crash.")
 
 with st.sidebar:
     st.header("Settings")
@@ -114,12 +109,9 @@ with st.sidebar:
     st.subheader("Time Horizon")
     min_dte = st.number_input("Min DTE", value=30)
     max_dte = st.number_input("Max DTE", value=90)
-    
-    # Checkbox to force 'Safe Mode'
-    safe_mode = st.checkbox("Safe Mode (Limit to 3 dates)", value=True, help="Uncheck this to scan ALL dates, but you risk getting blocked.")
+    safe_mode = st.checkbox("Safe Mode (Limit to 3 dates)", value=True)
 
     st.subheader("Filters")
-    # UPDATED DEFAULTS: Looser settings to ensure you see results first
     min_otm = st.slider("Min OTM %", 0.1, 0.5, 0.15)
     max_prem_pct = st.number_input("Max Premium %", value=0.01, format="%.4f")
     
@@ -131,11 +123,8 @@ with st.sidebar:
 if run_btn:
     try:
         # 1. Get Spot Price
-        # FIXED: Removed session argument
         stock = yf.Ticker(ticker)
         fast_info = stock.fast_info
-        
-        # Fallback if fast_info fails
         current_price = fast_info.last_price if fast_info.last_price else stock.history(period='1d')['Close'].iloc[-1]
         
         st.success(f"**{ticker}** Spot: **${current_price:,.2f}**")
@@ -148,8 +137,10 @@ if run_btn:
             st.stop()
             
         # 3. Calculate
-        df = calculate_metrics(raw_df, current_price, crash_drop)
+        df, crash_price = calculate_metrics(raw_df, current_price, crash_drop)
         
+        st.info(f"📉 **Scenario:** If {ticker} drops **{crash_drop:.0%}** (to **${crash_price:,.2f}**)...")
+
         # 4. Filter
         mask_otm = df['otm_pct'] >= min_otm
         mask_prem = df['prem_frac'] <= max_prem_pct
@@ -161,15 +152,29 @@ if run_btn:
         else:
             filtered = filtered.sort_values('crash_multiple', ascending=False).head(20)
             
-            # Simple Display
-            display = filtered[['expiration', 'strike', 'lastPrice', 'otm_pct', 'crash_multiple']].copy()
-            display['otm_pct'] = display['otm_pct'].apply(lambda x: f"{x:.1%}")
-            display['crash_multiple'] = display['crash_multiple'].apply(lambda x: f"{x:.1f}x")
-            display['lastPrice'] = display['lastPrice'].apply(lambda x: f"${x:.2f}")
+            # --- NEW: Clean "Story" Table ---
+            display = pd.DataFrame()
+            display['Expiration'] = filtered['expiration']
+            display['Strike'] = filtered['strike']
+            display['Cost Now'] = filtered['lastPrice']
+            display['Value in Crash'] = filtered['crash_value']
+            display['Multiplier (x)'] = filtered['crash_multiple']
+            display['OTM %'] = filtered['otm_pct']
+
+            # Formatting
+            display['OTM %'] = display['OTM %'].apply(lambda x: f"{x:.1%}")
+            display['Multiplier (x)'] = display['Multiplier (x)'].apply(lambda x: f"{x:.1f}x")
+            display['Cost Now'] = display['Cost Now'].apply(lambda x: f"${x:.2f}")
+            display['Value in Crash'] = display['Value in Crash'].apply(lambda x: f"${x:.2f}")
+            display['Strike'] = display['Strike'].apply(lambda x: f"${x:.0f}")
             
             st.dataframe(display, use_container_width=True)
             st.success(f"Top {len(filtered)} candidates shown above.")
+            st.markdown(
+                f"> **Intuition Example:** For the top row, you pay **{display.iloc[0]['Cost Now']}** today. "
+                f"If the market crashes to **${crash_price:,.2f}**, that option becomes worth **{display.iloc[0]['Value in Crash']}**. "
+                f"That is a **{display.iloc[0]['Multiplier (x)']}** return."
+            )
 
     except Exception as e:
         st.error(f"Error: {e}")
-        st.markdown("**Troubleshooting:** If you see 'Rate Limited', wait 2 minutes and try again.")

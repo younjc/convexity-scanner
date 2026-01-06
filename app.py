@@ -15,13 +15,28 @@ import json
 st.set_page_config(page_title="Convexity Screener", layout="wide")
 
 # ==========================================
+# NAVIGATION HANDLER (Fixes API Exception)
+# ==========================================
+# This must run before the sidebar widget is instantiated
+if 'nav_target' in st.session_state:
+    st.session_state['nav_radio'] = st.session_state['nav_target']
+    del st.session_state['nav_target']
+
+# Callback for "Current Holdings" buttons (Safe Navigation)
+def go_to_forensics(ticker, exp, strike):
+    st.session_state['f_ticker'] = ticker
+    st.session_state['f_exp'] = exp
+    st.session_state['f_strike'] = strike
+    st.session_state['nav_radio'] = "Contract Forensics"
+    st.session_state['trigger_forensics'] = True
+
+# ==========================================
 # DATABASE MANAGER (SQLite)
 # ==========================================
 
 DB_FILE = "convexity.db"
 
 def get_connection():
-    # check_same_thread=False is needed for Streamlit's threading model
     return sqlite3.connect(DB_FILE, check_same_thread=False)
 
 def init_db():
@@ -51,6 +66,14 @@ def init_db():
     """)
     
     # 3. Snapshots (Time-series data)
+    try:
+        c.execute("SELECT implied_volatility FROM option_snapshots LIMIT 1")
+    except sqlite3.OperationalError:
+        try:
+            c.execute("ALTER TABLE option_snapshots ADD COLUMN implied_volatility REAL")
+        except:
+            pass 
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS option_snapshots (
             snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,6 +84,7 @@ def init_db():
             last_price REAL,
             volume INTEGER,
             open_interest INTEGER,
+            implied_volatility REAL,
             dte INTEGER,
             otm_pct REAL,
             prem_frac REAL,
@@ -71,6 +95,19 @@ def init_db():
             FOREIGN KEY(contract_id) REFERENCES option_contracts(contract_id)
         )
     """)
+
+    # 4. Watchlist Table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT,
+            expiration TEXT,
+            strike REAL,
+            date_added TEXT,
+            UNIQUE(ticker, expiration, strike)
+        )
+    """)
+    
     conn.commit()
     conn.close()
 
@@ -95,7 +132,6 @@ def save_batch_results(run_id, run_ts, df_results):
     conn = get_connection()
     c = conn.cursor()
 
-    # 1. Upsert Contracts (Insert OR IGNORE)
     contracts_data = []
     for _, row in df_results.iterrows():
         contracts_data.append((row['Ticker'], row['expiration'], row['strike'], 'P'))
@@ -105,7 +141,6 @@ def save_batch_results(run_id, run_ts, df_results):
         VALUES (?, ?, ?, ?)
     """, contracts_data)
     
-    # 2. Resolve Contract IDs
     tickers = df_results['Ticker'].unique()
     placeholders = ','.join(['?']*len(tickers))
     query = f"SELECT contract_id, ticker, expiration, strike FROM option_contracts WHERE ticker IN ({placeholders}) AND option_type='P'"
@@ -116,7 +151,6 @@ def save_batch_results(run_id, run_ts, df_results):
         key = (row[1], row[2], row[3])
         id_map[key] = row[0]
 
-    # 3. Prepare Snapshots
     snapshots_data = []
     for _, row in df_results.iterrows():
         key = (row['Ticker'], row['expiration'], row['strike'])
@@ -131,6 +165,7 @@ def save_batch_results(run_id, run_ts, df_results):
                 row['lastPrice'],
                 row['volume'],
                 row['openInterest'],
+                row.get('impliedVolatility', 0),
                 row['dte'],
                 row['otm_pct'],
                 row['prem_frac'],
@@ -140,16 +175,80 @@ def save_batch_results(run_id, run_ts, df_results):
             
     c.executemany("""
         INSERT OR IGNORE INTO option_snapshots 
-        (run_id, contract_id, snapshot_ts_utc, underlying_price, last_price, volume, open_interest, dte, otm_pct, prem_frac, crash_value, crash_multiple)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (run_id, contract_id, snapshot_ts_utc, underlying_price, last_price, volume, open_interest, implied_volatility, dte, otm_pct, prem_frac, crash_value, crash_multiple)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, snapshots_data)
     
     conn.commit()
     conn.close()
 
+# --- Watchlist DB Functions ---
+def add_to_watchlist(ticker, exp, strike):
+    conn = get_connection()
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO watchlist (ticker, expiration, strike, date_added) VALUES (?, ?, ?, ?)",
+                  (ticker.upper(), exp, strike, datetime.utcnow().isoformat()))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def get_watchlist():
+    conn = get_connection()
+    df = pd.read_sql("SELECT * FROM watchlist", conn)
+    conn.close()
+    return df
+
+def delete_from_watchlist(item_id):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("DELETE FROM watchlist WHERE id = ?", (item_id,))
+    conn.commit()
+    conn.close()
+
+def get_watchlist_data_history():
+    conn = get_connection()
+    query = """
+        SELECT 
+            w.ticker, w.expiration, w.strike,
+            s.snapshot_ts_utc, s.last_price, s.volume, s.open_interest, s.implied_volatility, s.underlying_price, s.otm_pct
+        FROM watchlist w
+        JOIN option_contracts c ON w.ticker = c.ticker AND w.expiration = c.expiration AND w.strike = c.strike
+        JOIN option_snapshots s ON c.contract_id = s.contract_id
+        ORDER BY s.snapshot_ts_utc ASC
+    """
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df
+
+# --- Standard DB Functions ---
 def get_history_runs():
     conn = get_connection()
     df = pd.read_sql("SELECT run_id, run_ts_utc, tickers FROM scan_runs ORDER BY run_id DESC", conn)
+    conn.close()
+    return df
+
+def get_contract_history(ticker, expiration, strike):
+    conn = get_connection()
+    query = """
+        SELECT 
+            s.snapshot_ts_utc, s.last_price, s.volume, s.open_interest, s.implied_volatility, s.crash_multiple, s.underlying_price
+        FROM option_snapshots s
+        JOIN option_contracts c ON s.contract_id = c.contract_id
+        WHERE c.ticker = ? AND c.expiration = ? AND c.strike = ?
+        ORDER BY s.snapshot_ts_utc ASC
+    """
+    df = pd.read_sql(query, conn, params=(ticker, expiration, strike))
+    conn.close()
+    return df
+
+def get_available_contracts():
+    conn = get_connection()
+    query = "SELECT DISTINCT ticker, expiration, strike FROM option_contracts ORDER BY ticker, expiration, strike"
+    df = pd.read_sql(query, conn)
     conn.close()
     return df
 
@@ -170,36 +269,30 @@ def get_repricing_data(run_id_new, run_id_old):
     conn.close()
     return df
 
-def get_contract_history(ticker, expiration, strike):
-    """
-    Updated to fetch Open Interest for Time Series Analysis
-    """
+# --- Functions to Load Previous Run ---
+def get_last_run_id():
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT run_id FROM scan_runs ORDER BY run_id DESC LIMIT 1")
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def get_run_data(run_id):
     conn = get_connection()
     query = """
         SELECT 
-            s.snapshot_ts_utc, 
-            s.last_price, 
-            s.volume, 
-            s.open_interest,
-            s.crash_multiple, 
-            s.underlying_price
+            c.ticker as Ticker, c.expiration, c.strike, 
+            s.last_price as lastPrice, s.volume, s.open_interest as openInterest, 
+            s.crash_value, s.crash_multiple, s.otm_pct, s.dte, s.underlying_price
         FROM option_snapshots s
         JOIN option_contracts c ON s.contract_id = c.contract_id
-        WHERE c.ticker = ? AND c.expiration = ? AND c.strike = ?
-        ORDER BY s.snapshot_ts_utc ASC
+        WHERE s.run_id = ?
     """
-    df = pd.read_sql(query, conn, params=(ticker, expiration, strike))
+    df = pd.read_sql(query, conn, params=(run_id,))
     conn.close()
     return df
 
-def get_available_contracts():
-    conn = get_connection()
-    query = "SELECT DISTINCT ticker, expiration, strike FROM option_contracts ORDER BY ticker, expiration, strike"
-    df = pd.read_sql(query, conn)
-    conn.close()
-    return df
-
-# Initialize DB on import/startup
 try:
     init_db()
 except Exception as e:
@@ -219,7 +312,6 @@ def days_until(date_str):
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_options_data(ticker_symbol, min_dte_days, max_dte_days, max_dates_to_scan):
     tk = yf.Ticker(ticker_symbol)
-    
     try:
         expirations = tk.options
     except Exception:
@@ -260,6 +352,8 @@ def get_options_data(ticker_symbol, min_dte_days, max_dte_days, max_dates_to_sca
             if 'lastPrice' in puts.columns and 'strike' in puts.columns:
                 puts['volume'] = puts.get('volume', pd.Series([0]*len(puts))).fillna(0)
                 puts['openInterest'] = puts.get('openInterest', pd.Series([0]*len(puts))).fillna(0)
+                if 'impliedVolatility' not in puts.columns:
+                    puts['impliedVolatility'] = 0
                 all_puts.append(puts)
         except Exception:
             continue
@@ -270,53 +364,117 @@ def get_options_data(ticker_symbol, min_dte_days, max_dte_days, max_dates_to_sca
     df = pd.concat(all_puts, ignore_index=True)
     return df, None, warning_msg
 
+def get_closest_expiration(ticker_obj, target_date_str, debug_log=None):
+    try:
+        valid_dates = ticker_obj.options
+        if not valid_dates:
+            if debug_log is not None: debug_log.append("⚠️ Exchange returned NO expiration dates.")
+            return None
+        
+        if target_date_str in valid_dates:
+            return target_date_str
+            
+        target_date = datetime.strptime(target_date_str, '%Y-%m-%d').date()
+        closest_date = None
+        min_diff = 999
+        
+        for d_str in valid_dates:
+            try:
+                d_obj = datetime.strptime(d_str, '%Y-%m-%d').date()
+                diff = abs((d_obj - target_date).days)
+                if diff < min_diff:
+                    min_diff = diff
+                    closest_date = d_str
+            except:
+                continue
+        
+        if min_diff < 15:
+            if debug_log is not None: debug_log.append(f"✅ Auto-matched: {target_date_str} -> {closest_date}")
+            return closest_date
+        else:
+            if debug_log is not None: debug_log.append(f"❌ No date found near {target_date_str}.")
+            return None
+
+    except Exception as e:
+        if debug_log is not None: debug_log.append(f"Date Logic Error: {e}")
+        return None
+
+def smart_fetch_contract(ticker, user_exp, user_strike, debug_log=None):
+    tk = yf.Ticker(ticker)
+    
+    # 1. Resolve Expiration
+    best_exp = get_closest_expiration(tk, user_exp, debug_log)
+    if not best_exp:
+        return None, None, None
+        
+    try:
+        chain = tk.option_chain(best_exp)
+        puts = chain.puts
+        
+        if puts.empty:
+            if debug_log is not None: debug_log.append(f"Chain empty for {ticker} {best_exp}")
+            return None, None, None
+
+        # 2. Resolve Strike
+        puts['diff'] = abs(puts['strike'] - user_strike)
+        closest_row = puts.loc[puts['diff'].idxmin()]
+        max_allowed_diff = max(2.5, user_strike * 0.015)
+        
+        if closest_row['diff'] > max_allowed_diff:
+            if debug_log is not None: debug_log.append(f"Strike Mismatch: Wanted {user_strike}, found {closest_row['strike']}")
+            return None, best_exp, None
+            
+        contract = closest_row.copy()
+        contract['expiration'] = best_exp
+        if 'impliedVolatility' not in contract:
+            contract['impliedVolatility'] = 0
+            
+        return contract, best_exp, closest_row['strike']
+    except Exception as e:
+        if debug_log is not None: debug_log.append(f"Fetch Error {ticker}: {e}")
+        return None, None, None
+
 def calculate_metrics(df, underlying_price, crash_drop=0.35):
     df['dte'] = df['expiration'].apply(days_until)
-    df['otm_pct'] = (underlying_price - df['strike']) / underlying_price
-    df['prem_frac'] = df['lastPrice'] / underlying_price
     
-    crash_price = underlying_price * (1 - crash_drop)
-    df['crash_value'] = (df['strike'] - crash_price).clip(lower=0)
+    if underlying_price > 0:
+        df['otm_pct'] = (underlying_price - df['strike']) / underlying_price
+        df['prem_frac'] = df['lastPrice'] / underlying_price
+        crash_price = underlying_price * (1 - crash_drop)
+        df['crash_value'] = (df['strike'] - crash_price).clip(lower=0)
+    else:
+        df['otm_pct'] = 0
+        df['prem_frac'] = 0
+        df['crash_value'] = 0
     
     df['crash_multiple'] = np.where(
         df['lastPrice'] > 0.01, 
         df['crash_value'] / df['lastPrice'], 
         0
     )
-    return df, crash_price
+    return df, 0
 
 def analyze_microstructure(df):
-    """
-    Performs time-series analysis on option snapshots to determine positioning behavior.
-    """
     df = df.copy()
     df['snapshot_ts_utc'] = pd.to_datetime(df['snapshot_ts_utc'])
     df = df.sort_values('snapshot_ts_utc')
     
-    # Calculate Deltas
     df['delta_oi'] = df['open_interest'].diff().fillna(0)
     df['delta_price'] = df['last_price'].diff().fillna(0)
     
-    # Classify Daily Action
     def classify_day(row):
-        if row['delta_oi'] > 0:
-            return "Accumulation"
-        elif row['delta_oi'] < 0:
-            return "Distribution"
-        else:
-            return "Flat"
+        if row['delta_oi'] > 0: return "Accretion"
+        elif row['delta_oi'] < 0: return "Unwind"
+        else: return "Hold"
             
     df['action'] = df.apply(classify_day, axis=1)
     
-    # Churn Detection: Volume > 5x abs(Delta OI) and Volume > 50
-    df['is_churn'] = (df['volume'] > 50) & (df['volume'] > 5 * df['delta_oi'].abs())
+    mask_churn = (df['volume'] > 50) & (df['volume'] > 5 * df['delta_oi'].abs())
+    df.loc[mask_churn, 'action'] = "Churn"
     
     return df
 
 def generate_verdict(df):
-    """
-    Generates a text verdict based on the trend of Open Interest and Volume.
-    """
     if len(df) < 2:
         return "Insufficient Data", "Need at least 2 data points to analyze trend."
         
@@ -324,7 +482,6 @@ def generate_verdict(df):
     end_oi = df['open_interest'].iloc[-1]
     net_oi_change = end_oi - start_oi
     
-    # Determine Trend
     if net_oi_change > (start_oi * 0.10) and net_oi_change > 50:
         trend = "Accreting Hedge"
         desc = "Consistent increase in Open Interest suggests net new positioning (risk adding)."
@@ -332,11 +489,10 @@ def generate_verdict(df):
         trend = "Active Unwind"
         desc = "Significant decrease in Open Interest suggests closing of positions."
     else:
-        # Check for Churn vs Static
-        churn_days = df['is_churn'].sum()
+        churn_days = (df['action'] == "Churn").sum()
         if churn_days / len(df) > 0.5:
             trend = "High-Churn / Non-Directional"
-            desc = "High volume relative to OI changes indicates intraday trading or rolling without net exposure shift."
+            desc = "High volume relative to OI changes indicates intraday trading or rolling."
         else:
             trend = "Static Hedge"
             desc = "Open Interest has remained relatively stable (Held Inventory)."
@@ -348,16 +504,18 @@ def generate_verdict(df):
 # ==========================================
 
 st.sidebar.title("Navigation")
-app_mode = st.sidebar.radio("Go to", ["Live Scanner", "History Analysis", "Contract Forensics"])
+app_mode = st.sidebar.radio("Go to", ["Live Scanner", "Put Watchlist", "History Analysis", "Contract Forensics"], key="nav_radio")
 
+# -----------------------------------------------------------------------------
+# MODE: LIVE SCANNER
+# -----------------------------------------------------------------------------
 if app_mode == "Live Scanner":
-    # --- Live Scanner UI ---
     st.title("🛡️ Tail-Risk Convexity Screener")
-    st.caption("Compare crash protection across multiple assets simultaneously. Results are saved to DB.")
+    st.caption("Scan entire chains to find cheap crash protection.")
 
     with st.sidebar:
         st.header("Settings")
-        ticker_input = st.text_input("Enter Tickers (comma-separated)", value="SPY, QQQ, IWM", help="Example: SPY, QQQ, IWM, HYG, FXI")
+        ticker_input = st.text_input("Enter Tickers (comma-separated)", value="SPY, QQQ, IWM")
         
         st.subheader("Time Horizon & Speed")
         min_dte = st.number_input("Min DTE", value=30)
@@ -377,110 +535,375 @@ if app_mode == "Live Scanner":
         
         st.divider()
         show_all_results = st.checkbox("Show All Candidates", value=False)
-        run_btn = st.button("Run Batch Scan", type="primary")
+        
+        # --- BUTTONS ---
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            run_btn = st.button("Run Batch Scan", type="primary")
+        with col_btn2:
+            load_last_btn = st.button("📂 Load Last Run")
 
+    # --- ACTION HANDLERS ---
+    
+    # 1. LOAD LAST RUN HANDLER
+    if load_last_btn:
+        last_id = get_last_run_id()
+        if last_id:
+            with st.spinner("Retrieving last run from database..."):
+                df_last = get_run_data(last_id)
+                if not df_last.empty:
+                    df_last = df_last.sort_values('crash_multiple', ascending=False)
+                    st.session_state['scan_results'] = df_last
+                    st.session_state['force_full_view'] = True
+                    st.success(f"Loaded {len(df_last)} contracts from Run ID {last_id}")
+        else:
+            st.warning("No previous runs found in database.")
+
+    # 2. NEW SCAN HANDLER
     if run_btn:
         tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
         if not tickers:
             st.error("Please enter at least one ticker.")
-            st.stop()
-
-        settings = {"min_dte": min_dte, "max_dte": max_dte, "min_otm": min_otm, "crash_drop": crash_drop}
-        current_run_id, current_run_ts = log_scan_run(tickers, settings)
-        
-        master_results = []
-        errors = []
-        progress_bar = st.progress(0, text="Starting Batch Scan...")
-        
-        for idx, ticker in enumerate(tickers):
-            progress_bar.progress(int((idx / len(tickers)) * 100), text=f"Scanning {ticker}...")
-            try:
-                stock = yf.Ticker(ticker)
-                hist = stock.history(period="1d")
-                if hist.empty:
-                    errors.append(f"Could not fetch price for {ticker}")
-                    continue
-                current_price = hist['Close'].iloc[-1]
-                
-                raw_df, err, warn = get_options_data(ticker, min_dte, max_dte, max_dates)
-                if err: continue
-                
-                df, crash_price = calculate_metrics(raw_df, current_price, crash_drop)
-                df['Ticker'] = ticker
-                df['underlying_price'] = current_price
-
-                try:
-                    save_batch_results(current_run_id, current_run_ts, df)
-                except Exception as e:
-                    errors.append(f"DB Error for {ticker}: {e}")
-
-                mask_otm = df['otm_pct'] >= min_otm
-                mask_prem = df['prem_frac'] <= max_prem_pct
-                mask_vol = df['volume'] >= min_vol
-                mask_oi = df['openInterest'] >= min_oi
-                filtered = df[mask_otm & mask_prem & mask_vol & mask_oi].copy()
-                
-                if not filtered.empty:
-                    master_results.append(filtered)
-            except Exception as e:
-                errors.append(f"Error scanning {ticker}: {str(e)}")
-        progress_bar.empty()
-
-        if not master_results:
-            st.warning("No options found matching your criteria. Raw data saved to History.")
-            if errors: st.write(errors)
         else:
-            final_df = pd.concat(master_results, ignore_index=True)
-            final_df = final_df.sort_values('crash_multiple', ascending=False)
+            settings = {"min_dte": min_dte, "max_dte": max_dte, "min_otm": min_otm, "crash_drop": crash_drop}
+            current_run_id, current_run_ts = log_scan_run(tickers, settings)
             
-            if not show_all_results:
-                display_data = final_df.head(20)
-                st.success(f"✅ Found {len(final_df)} total candidates. Showing Top 20.")
+            master_results = []
+            errors = []
+            progress_bar = st.progress(0, text="Starting Batch Scan...")
+            
+            for idx, ticker in enumerate(tickers):
+                progress_bar.progress(int((idx / len(tickers)) * 100), text=f"Scanning {ticker}...")
+                try:
+                    stock = yf.Ticker(ticker)
+                    try:
+                        hist = stock.history(period="1d")
+                        if not hist.empty:
+                            current_price = hist['Close'].iloc[-1]
+                        else:
+                            current_price = stock.fast_info['last_price']
+                    except:
+                        current_price = 0
+                    
+                    if current_price == 0:
+                        errors.append(f"Could not get price for {ticker}")
+                        continue
+
+                    raw_df, err, warn = get_options_data(ticker, min_dte, max_dte, max_dates)
+                    if err: continue
+                    
+                    df, _ = calculate_metrics(raw_df, current_price, crash_drop)
+                    df['Ticker'] = ticker
+                    df['underlying_price'] = current_price
+
+                    try:
+                        save_batch_results(current_run_id, current_run_ts, df)
+                    except Exception as e:
+                        errors.append(f"DB Error for {ticker}: {e}")
+
+                    mask_otm = df['otm_pct'] >= min_otm
+                    mask_prem = df['prem_frac'] <= max_prem_pct
+                    mask_vol = df['volume'] >= min_vol
+                    mask_oi = df['openInterest'] >= min_oi
+                    filtered = df[mask_otm & mask_prem & mask_vol & mask_oi].copy()
+                    
+                    if not filtered.empty:
+                        master_results.append(filtered)
+                except Exception as e:
+                    errors.append(f"Error scanning {ticker}: {str(e)}")
+            progress_bar.empty()
+
+            if not master_results:
+                st.warning("No options found. Raw data saved to History.")
+                if errors: st.write(errors)
             else:
-                display_data = final_df
-                st.success(f"✅ Found {len(final_df)} candidates across {len(tickers)} tickers.")
-
-            csv = final_df.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download Results (CSV)", csv, "convexity_batch_scan.csv", "text/csv")
-            
-            view = display_data[['Ticker', 'expiration', 'strike', 'lastPrice', 'volume', 'openInterest', 'crash_value', 'crash_multiple', 'otm_pct']].copy()
-            view.columns = ['Ticker', 'Expiration', 'Strike', 'Cost Now', 'Vol', 'Open Int', 'Value in Crash', 'Multiplier (x)', 'OTM %']
-
-            def bold_top_rows(x):
-                return ['font-weight: bold' if i < 3 else '' for i in range(len(x))]
-
-            st.dataframe(view.style.format({
-                'Strike': '${:,.0f}', 'Cost Now': '${:.2f}', 'Value in Crash': '${:.2f}',
-                'Multiplier (x)': '{:.1f}x', 'OTM %': '{:.1%}', 'Vol': '{:,.0f}', 'Open Int': '{:,.0f}'
-            }).background_gradient(subset=['Multiplier (x)'], cmap='Greens').apply(bold_top_rows, axis=0), use_container_width=True)
-
-            # --- Chart ---
-            st.divider()
-            chart_data = final_df.copy()
-            chart_data["dte"] = chart_data["dte"].astype(float)
-            chart_data["expiration_str"] = chart_data["expiration"].astype(str)
-            summary = chart_data.groupby(["Ticker", "expiration_str", "dte"]).agg(
-                avg_multiple=("crash_multiple", "mean"), count=("crash_multiple", "size")).reset_index()
-
-            if not summary.empty:
-                st.markdown("### 📆 Convexity Comparison (Color by Ticker)")
-                fig, ax = plt.subplots(figsize=(10, 5))
-                unique_tickers = summary['Ticker'].unique()
-                colors = plt.cm.tab10(np.linspace(0, 1, len(unique_tickers)))
-                color_map = dict(zip(unique_tickers, colors))
+                final_df = pd.concat(master_results, ignore_index=True)
+                final_df = final_df.sort_values('crash_multiple', ascending=False)
                 
-                for ticker in unique_tickers:
-                    subset = summary[summary['Ticker'] == ticker]
-                    ax.scatter(subset["dte"], subset["avg_multiple"], s=subset["count"] * 50.0, alpha=0.7, label=ticker, color=color_map[ticker], edgecolors='black')
+                st.session_state['scan_results'] = final_df
+                st.session_state['force_full_view'] = False
+                st.rerun()
 
-                ax.set_xlabel("Days to Expiration")
-                ax.set_ylabel("Avg Multiplier (x)")
-                ax.grid(True, linestyle='--', alpha=0.3)
-                legend_elements = [Line2D([0], [0], marker='o', color='w', label=t, markerfacecolor=color_map[t], markersize=10, markeredgecolor='black') for t in unique_tickers]
-                ax.legend(handles=legend_elements, title="Ticker", bbox_to_anchor=(1.05, 1), loc='upper left')
-                plt.tight_layout()
-                st.pyplot(fig)
+    # --- DISPLAY LOGIC (PERSISTENT) ---
+    if 'scan_results' in st.session_state and not st.session_state['scan_results'].empty:
+        final_df = st.session_state['scan_results']
+        
+        show_full = show_all_results or st.session_state.get('force_full_view', False)
+        
+        if not show_full:
+            display_data = final_df.head(20).copy()
+            st.info(f"Showing Top 20 of {len(final_df)} candidates. (Live Scan Mode)")
+        else:
+            display_data = final_df.copy()
+            st.info(f"Showing all {len(final_df)} candidates.")
 
+        csv = final_df.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Results (CSV)", csv, "convexity_batch_scan.csv", "text/csv")
+        
+        # --- INTERACTIVE RESULTS TABLE ---
+        st.write("### 🎯 Scan Results (Select to Add to Watchlist)")
+        
+        view = display_data[['Ticker', 'expiration', 'strike', 'lastPrice', 'volume', 'openInterest', 'crash_value', 'crash_multiple', 'otm_pct']].copy()
+        view.insert(0, "Add", False) 
+        
+        edited_df = st.data_editor(
+            view,
+            column_config={
+                "Add": st.column_config.CheckboxColumn("Add?", help="Check to add to Watchlist", default=False),
+                "Ticker": st.column_config.TextColumn("Ticker", disabled=True),
+                "expiration": st.column_config.TextColumn("Expiration", disabled=True),
+                "strike": st.column_config.NumberColumn("Strike", format="$%.0f", disabled=True),
+                "lastPrice": st.column_config.NumberColumn("Cost Now", format="$%.2f", disabled=True),
+                "volume": st.column_config.NumberColumn("Vol", format="%.0f", disabled=True),
+                "openInterest": st.column_config.NumberColumn("Open Int", format="%.0f", disabled=True),
+                "crash_value": st.column_config.NumberColumn("Value in Crash", format="$%.2f", disabled=True),
+                "crash_multiple": st.column_config.NumberColumn("Multiplier", format="%.1fx", disabled=True),
+                "otm_pct": st.column_config.NumberColumn("OTM %", format="%.1f%%", disabled=True),
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+
+        if st.button("➕ Add Selected to Watchlist", type="primary"):
+            selected_rows = edited_df[edited_df["Add"] == True]
+            
+            if selected_rows.empty:
+                st.warning("No contracts selected.")
+            else:
+                count = 0
+                for index, row in selected_rows.iterrows():
+                    if add_to_watchlist(row['Ticker'], row['expiration'], row['strike']):
+                        count += 1
+                
+                if count > 0:
+                    st.success(f"✅ Successfully added {count} contracts to Watchlist!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.warning("Selected contracts were already in the Watchlist.")
+
+# -----------------------------------------------------------------------------
+# MODE: PUT WATCHLIST
+# -----------------------------------------------------------------------------
+elif app_mode == "Put Watchlist":
+    st.title("📋 Put Option Watchlist")
+    st.caption("Monitor specific contracts. Auto-corrects dates if misaligned.")
+
+    with st.expander("Manage Watchlist", expanded=True):
+        col_in1, col_in2, col_in3, col_in4 = st.columns(4)
+        with col_in1:
+            w_ticker = st.text_input("Ticker", value="SPY")
+        with col_in2:
+            w_exp = st.text_input("Expiration (YYYY-MM-DD)", value="2025-06-20")
+        with col_in3:
+            w_strike = st.number_input("Strike", value=450.0, step=1.0)
+        with col_in4:
+            st.write("")
+            st.write("")
+            if st.button("Add to Watchlist"):
+                if add_to_watchlist(w_ticker, w_exp, w_strike):
+                    st.success(f"Added {w_ticker} {w_exp} {w_strike}P")
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    st.error("Could not add. Duplicate entry?")
+
+        watchlist_df = get_watchlist()
+        if not watchlist_df.empty:
+            st.subheader("Current Holdings")
+            cols_header = st.columns([1, 2, 1, 1, 1])
+            cols_header[0].write("**Ticker**")
+            cols_header[1].write("**Contract**")
+            cols_header[2].write("**Added**")
+            cols_header[3].write("**Analyze**")
+            cols_header[4].write("**Delete**")
+            
+            st.divider()
+
+            for idx, row in watchlist_df.iterrows():
+                c1, c2, c3, c4, c5 = st.columns([1, 2, 1, 1, 1])
+                with c1: st.write(f"**{row['ticker']}**")
+                with c2: st.write(f"{row['expiration']} **${row['strike']}P**")
+                with c3: st.write(f"{row['date_added'][:10]}")
+                
+                # FIX: Use Callback to prevent "modified after instantiated" error
+                with c4:
+                    st.button("🔎", key=f"analyze_{row['id']}", 
+                              on_click=go_to_forensics, 
+                              args=(row['ticker'], row['expiration'], row['strike']))
+                        
+                with c5: 
+                    if st.button("🗑️", key=f"del_{row['id']}"):
+                        delete_from_watchlist(row['id'])
+                        st.rerun()
+        else:
+            st.info("Watchlist is empty. Add contracts above.")
+
+    st.divider()
+
+    if not watchlist_df.empty:
+        col_act1, col_act2 = st.columns([1, 4])
+        with col_act1:
+            if st.button("🔄 Update Watchlist Data", type="primary"):
+                progress_bar = st.progress(0, text="Updating Watchlist...")
+                results = []
+                updates_made = []
+                debug_logs = []
+                
+                run_id, run_ts = log_scan_run(watchlist_df['ticker'].unique().tolist(), {"type": "watchlist_update"})
+                total_items = len(watchlist_df)
+                
+                conn = get_connection()
+                c = conn.cursor()
+                
+                for i, row in watchlist_df.iterrows():
+                    progress_bar.progress(int((i) / total_items * 100), text=f"Fetching {row['ticker']}...")
+                    try:
+                        tk_obj = yf.Ticker(row['ticker'])
+                        
+                        price = 0
+                        try:
+                            hist = tk_obj.history(period="1d")
+                            if not hist.empty:
+                                price = hist['Close'].iloc[-1]
+                            else:
+                                price = tk_obj.fast_info['last_price']
+                        except:
+                            debug_logs.append(f"{row['ticker']}: Failed to get underlying price.")
+                            price = 0
+                        
+                        opt_data, real_exp, real_strike = smart_fetch_contract(row['ticker'], row['expiration'], row['strike'], debug_logs)
+                        
+                        if opt_data is not None:
+                            if real_exp != row['expiration'] or abs(real_strike - row['strike']) > 0.01:
+                                c.execute("UPDATE watchlist SET expiration = ?, strike = ? WHERE id = ?", (real_exp, real_strike, row['id']))
+                                updates_made.append(f"{row['ticker']}: {row['expiration']} -> {real_exp}")
+
+                            d = opt_data.to_dict()
+                            d['Ticker'] = row['ticker']
+                            d['expiration'] = real_exp 
+                            
+                            processed, _ = calculate_metrics(pd.DataFrame([d]), price, 0.25)
+                            processed['underlying_price'] = price
+                            results.append(processed)
+                    except Exception as e:
+                        debug_logs.append(f"CRITICAL Error on {row['ticker']}: {e}")
+                
+                conn.commit()
+                conn.close()
+                progress_bar.empty()
+                
+                with st.expander("View Debug Logs (If data is missing)", expanded=True):
+                    for log in debug_logs:
+                        st.text(log)
+
+                if updates_made:
+                    st.info(f"ℹ️ Auto-corrected {len(updates_made)} contracts to valid dates.")
+                
+                if results:
+                    final_df = pd.concat(results, ignore_index=True)
+                    save_batch_results(run_id, run_ts, final_df)
+                    st.success("Watchlist updated!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.warning("Could not fetch data. Check 'View Debug Logs' below.")
+
+    st.subheader("📊 Watchlist Dashboard")
+    hist_data = get_watchlist_data_history()
+    
+    if hist_data.empty:
+        st.warning("No data found. Click 'Update Watchlist Data'.")
+    else:
+        hist_data['snapshot_ts_utc'] = pd.to_datetime(hist_data['snapshot_ts_utc'])
+        hist_data = hist_data.sort_values(['ticker', 'expiration', 'strike', 'snapshot_ts_utc'])
+        
+        analyzed_frames = []
+        for (t, e, s), group in hist_data.groupby(['ticker', 'expiration', 'strike']):
+            analyzed_frames.append(analyze_microstructure(group))
+        
+        if analyzed_frames:
+            full_analysis = pd.concat(analyzed_frames)
+            latest_view = full_analysis.sort_values('snapshot_ts_utc').groupby(['ticker', 'expiration', 'strike']).tail(1).copy()
+            
+            # --- AGGREGATE STATS ---
+            total_oi = latest_view['open_interest'].sum()
+            net_delta_oi = latest_view['delta_oi'].sum()
+            weighted_otm = (latest_view['otm_pct'] * latest_view['open_interest']).sum() / total_oi if total_oi > 0 else 0
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Watchlist OI", f"{total_oi:,.0f}", delta=f"{net_delta_oi:,.0f}")
+            m2.metric("Weighted OTM %", f"{weighted_otm:.1%}")
+            
+            # Reflexivity Check
+            reflexive_count = 0
+            for i, row in latest_view.iterrows():
+                prev_rows = full_analysis[(full_analysis['ticker']==row['ticker']) & 
+                                          (full_analysis['expiration']==row['expiration']) & 
+                                          (full_analysis['strike']==row['strike']) &
+                                          (full_analysis['snapshot_ts_utc'] < row['snapshot_ts_utc'])]
+                if not prev_rows.empty:
+                    prev = prev_rows.iloc[-1]
+                    if (row['underlying_price'] < prev['underlying_price'] * 0.995) and \
+                       (row['implied_volatility'] > prev['implied_volatility']) and \
+                       (row['delta_oi'] > 0):
+                        reflexive_count += 1
+
+            if reflexive_count >= 2:
+                m3.error(f"⚠️ REFLEXIVITY: Active ({reflexive_count})")
+            elif reflexive_count == 1:
+                m3.warning("⚠️ REFLEXIVITY: Early")
+            else:
+                m3.success("Reflexivity: None")
+
+            def color_verdict(val):
+                if val == 'Accretion': return 'color: green; font-weight: bold'
+                if val == 'Unwind': return 'color: red; font-weight: bold'
+                if val == 'Churn': return 'color: orange; font-weight: bold'
+                return ''
+                
+            # --- INTERACTIVE DASHBOARD TABLE ---
+            st.write("### Contract Status (Select to Analyze)")
+            
+            display = latest_view[['ticker', 'expiration', 'strike', 'last_price', 'volume', 'open_interest', 'delta_oi', 'implied_volatility', 'otm_pct', 'action']].copy()
+            display.insert(0, "Select", False)
+            
+            edited_dash = st.data_editor(
+                display,
+                column_config={
+                    "Select": st.column_config.CheckboxColumn("Select", default=False),
+                    "ticker": "Ticker",
+                    "expiration": "Exp",
+                    "strike": st.column_config.NumberColumn("Strike", format="$%.1f"),
+                    "last_price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                    "volume": st.column_config.NumberColumn("Vol", format="%.0f"),
+                    "open_interest": st.column_config.NumberColumn("OI", format="%.0f"),
+                    "delta_oi": st.column_config.NumberColumn("ΔOI", format="%+.0f"),
+                    "implied_volatility": st.column_config.NumberColumn("IV", format="%.1%"),
+                    "otm_pct": st.column_config.NumberColumn("OTM", format="%.1%"),
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            if st.button("🔎 Analyze Selected Contract"):
+                selected_rows = edited_dash[edited_dash["Select"] == True]
+                if selected_rows.empty:
+                    st.warning("Please select a row first.")
+                else:
+                    # Take the first selected row
+                    row = selected_rows.iloc[0]
+                    # Use nav_target logic because we are in the script body, not a callback
+                    st.session_state['f_ticker'] = row['ticker']
+                    st.session_state['f_exp'] = row['expiration']
+                    st.session_state['f_strike'] = row['strike']
+                    st.session_state['nav_target'] = "Contract Forensics"
+                    st.session_state['trigger_forensics'] = True
+                    st.rerun()
+
+# -----------------------------------------------------------------------------
+# MODE: HISTORY ANALYSIS
+# -----------------------------------------------------------------------------
 elif app_mode == "History Analysis":
     st.title("📜 Market Memory & Repricing")
     runs = get_history_runs()
@@ -513,11 +936,13 @@ elif app_mode == "History Analysis":
                     df_comp['repricing_score'] = (df_comp['price_chg_pct'].fillna(0) + 0.5 * df_comp['mult_chg_pct'].fillna(0) + 0.1 * np.log1p(df_comp['vol_new']))
                     df_comp = df_comp.sort_values('repricing_score', ascending=False)
                     
-                    st.write(f"Comparing **{len(df_comp)}** matching contracts.")
                     st.dataframe(df_comp[['ticker', 'expiration', 'strike', 'price_new', 'price_chg_pct', 'mult_new', 'mult_chg_pct', 'vol_new', 'repricing_score']].head(20).style.format({
                         'strike': '{:,.1f}', 'price_new': '${:.2f}', 'price_chg_pct': '{:+.1%}', 'mult_new': '{:.1f}x', 'mult_chg_pct': '{:+.1%}', 'vol_new': '{:,.0f}', 'repricing_score': '{:.2f}'
                     }).background_gradient(subset=['repricing_score'], cmap='coolwarm'), use_container_width=True)
 
+# -----------------------------------------------------------------------------
+# MODE: CONTRACT FORENSICS
+# -----------------------------------------------------------------------------
 elif app_mode == "Contract Forensics":
     st.title("🕵️ Single-Contract Forensics")
     st.caption("Track positioning evolution: Accreting, Static, or Unwinding.")
@@ -525,45 +950,60 @@ elif app_mode == "Contract Forensics":
     avail = get_available_contracts()
     
     if avail.empty:
-        st.warning("No data found. Please run the 'Live Scanner' first to populate the database.")
+        st.warning("No data found. Please run the 'Live Scanner' first.")
     else:
-        # --- SELECTION HEADER ---
         with st.container():
             col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+            
+            # Pre-selection Logic
+            def_ticker_ix = 0
+            if 'f_ticker' in st.session_state and st.session_state['f_ticker'] in avail['ticker'].unique():
+                def_ticker_ix = list(avail['ticker'].unique()).index(st.session_state['f_ticker'])
+            
             with col1:
-                sel_ticker = st.selectbox("Ticker", avail['ticker'].unique())
+                sel_ticker = st.selectbox("Ticker", avail['ticker'].unique(), index=def_ticker_ix)
                 avail_exp = avail[avail['ticker'] == sel_ticker]['expiration'].unique()
+            
+            def_exp_ix = 0
+            if 'f_exp' in st.session_state and st.session_state['f_exp'] in avail_exp:
+                def_exp_ix = list(sorted(avail_exp)).index(st.session_state['f_exp'])
+            
             with col2:
-                sel_exp = st.selectbox("Expiration", sorted(avail_exp))
+                sel_exp = st.selectbox("Expiration", sorted(avail_exp), index=def_exp_ix)
                 avail_str = avail[(avail['ticker'] == sel_ticker) & (avail['expiration'] == sel_exp)]['strike'].unique()
+            
+            def_strike_ix = 0
+            if 'f_strike' in st.session_state and st.session_state['f_strike'] in avail_str:
+                def_strike_ix = list(sorted(avail_str)).index(st.session_state['f_strike'])
+            
             with col3:
-                sel_strike = st.selectbox("Strike", sorted(avail_str))
+                sel_strike = st.selectbox("Strike", sorted(avail_str), index=def_strike_ix)
+            
             with col4:
-                st.write("") # Spacer
-                st.write("") # Spacer
+                st.write("")
+                st.write("")
                 run_analysis = st.button("🔎 Run Forensics", type="primary")
 
         st.divider()
 
-        if run_analysis:
-            # 1. Fetch Data
-            raw_df = get_contract_history(sel_ticker, sel_exp, sel_strike)
+        if run_analysis or st.session_state.get('trigger_forensics', False):
+            # Reset Trigger
+            st.session_state['trigger_forensics'] = False
             
+            raw_df = get_contract_history(sel_ticker, sel_exp, sel_strike)
             if raw_df.empty:
                 st.error("No history found for this contract.")
             elif len(raw_df) < 2:
-                st.warning("Not enough data points (need at least 2 scan runs) to perform time-series analysis.")
+                st.warning("Not enough data points to analyze trend.")
                 st.dataframe(raw_df)
             else:
-                # 2. Run Analysis
                 df = analyze_microstructure(raw_df)
                 verdict, reason = generate_verdict(df)
                 
-                # --- VERDICT BANNER ---
-                verdict_color = "#2b6cb0" # Blue
-                if "Accreting" in verdict: verdict_color = "#2f855a" # Green
-                if "Unwind" in verdict: verdict_color = "#c53030" # Red
-                if "Churn" in verdict: verdict_color = "#dd6b20" # Orange
+                verdict_color = "#2b6cb0"
+                if "Accreting" in verdict: verdict_color = "#2f855a"
+                if "Unwind" in verdict: verdict_color = "#c53030"
+                if "Churn" in verdict: verdict_color = "#dd6b20"
                 
                 st.markdown(f"""
                 <div style="padding: 20px; border-radius: 10px; background-color: rgba(200, 200, 200, 0.1); border-left: 5px solid {verdict_color};">
@@ -572,15 +1012,7 @@ elif app_mode == "Contract Forensics":
                 </div>
                 """, unsafe_allow_html=True)
                 
-                st.caption("⚠️ **Limitations:** Database does not currently store Bid/Ask spread or Implied Volatility. Analysis is based strictly on Price, Volume, and Open Interest dynamics.")
-                
-                # --- VISUALIZATION ---
-                st.subheader("Time-Series Evolution")
-                
-                # Dual Axis Chart: Price vs Open Interest
                 fig, ax1 = plt.subplots(figsize=(12, 6))
-                
-                # OI Area Plot
                 color_oi = 'tab:blue'
                 ax1.set_xlabel('Date')
                 ax1.set_ylabel('Open Interest', color=color_oi, fontweight='bold')
@@ -588,7 +1020,6 @@ elif app_mode == "Contract Forensics":
                 ax1.plot(df['snapshot_ts_utc'], df['open_interest'], color=color_oi, marker='o', label='Open Interest')
                 ax1.tick_params(axis='y', labelcolor=color_oi)
                 
-                # Price Line Plot
                 ax2 = ax1.twinx()
                 color_price = 'tab:green'
                 ax2.set_ylabel('Option Price ($)', color=color_price, fontweight='bold')
@@ -597,19 +1028,13 @@ elif app_mode == "Contract Forensics":
                 
                 plt.title(f"Positioning Structure: {sel_ticker} {sel_exp} ${sel_strike}P")
                 ax1.grid(True, linestyle=':', alpha=0.6)
-                
                 lines1, labels1 = ax1.get_legend_handles_labels()
                 lines2, labels2 = ax2.get_legend_handles_labels()
                 ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
-                
                 fig.autofmt_xdate()
                 st.pyplot(fig)
                 
-                # --- SUMMARY TABLE ---
-                st.subheader("Microstructure Ledger")
-                
-                display_cols = ['snapshot_ts_utc', 'last_price', 'volume', 'open_interest', 'delta_oi', 'action', 'is_churn', 'underlying_price']
-                
+                display_cols = ['snapshot_ts_utc', 'last_price', 'volume', 'open_interest', 'delta_oi', 'action', 'underlying_price']
                 def color_action(val):
                     color = ''
                     if val == 'Accumulation': color = 'green'
@@ -617,12 +1042,7 @@ elif app_mode == "Contract Forensics":
                     return f'color: {color}; font-weight: bold' if color else ''
 
                 styled_df = df[display_cols].sort_values('snapshot_ts_utc', ascending=False).style.format({
-                    'snapshot_ts_utc': '{:%Y-%m-%d %H:%M}',
-                    'last_price': '${:.2f}',
-                    'volume': '{:,.0f}',
-                    'open_interest': '{:,.0f}',
-                    'delta_oi': '{:+,.0f}',
-                    'underlying_price': '${:,.2f}'
+                    'snapshot_ts_utc': '{:%Y-%m-%d %H:%M}', 'last_price': '${:.2f}', 'volume': '{:,.0f}',
+                    'open_interest': '{:,.0f}', 'delta_oi': '{:+,.0f}', 'underlying_price': '${:,.2f}'
                 }).map(color_action, subset=['action'])
-                
                 st.dataframe(styled_df, use_container_width=True)
